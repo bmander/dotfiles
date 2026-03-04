@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Opens a tmux window with a shell inside the devcontainer for the current
+# repo (or worktree). Builds the image and creates the container on first use.
+#
+# Usage: cd into any repo with a .devcontainer/Dockerfile, then run:
+#   ~/devcontainer.sh
+
+derive_names() {
+    local workspace="$1"
+    local slug
+    slug="$(basename "$workspace" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')"
+    IMAGE="devcontainer-${slug}"
+    CONTAINER="devcontainer-${slug}"
+}
+
+parse_devcontainer_json() {
+    local config="$1/.devcontainer/devcontainer.json"
+    MOUNTS=()
+    POST_CREATE=""
+    if [ -f "$config" ] && command -v python3 &>/dev/null; then
+        eval "$(python3 -c "
+import json, re, shlex
+
+with open('$config') as f:
+    text = re.sub(r'//.*', '', f.read())
+    cfg = json.loads(text)
+
+mounts = cfg.get('mounts', [])
+for i, m in enumerate(mounts):
+    print(f'MOUNTS[{i}]={shlex.quote(m)}')
+
+pc = cfg.get('postCreateCommand', '')
+print(f'POST_CREATE={shlex.quote(pc)}')
+" 2>/dev/null)"
+    fi
+}
+
+do_connect() {
+    local workspace="$1"
+    derive_names "$workspace"
+    parse_devcontainer_json "$workspace"
+
+    if docker container inspect "$CONTAINER" &>/dev/null; then
+        if [ "$(docker container inspect -f '{{.State.Running}}' "$CONTAINER")" = "true" ]; then
+            exec docker exec -it "$CONTAINER" bash
+        else
+            docker start "$CONTAINER" >/dev/null
+            exec docker exec -it "$CONTAINER" bash
+        fi
+    fi
+
+    # First run — create the container
+    local mount_args=()
+    for m in "${MOUNTS[@]+"${MOUNTS[@]}"}"; do
+        mount_args+=(--mount "$m")
+    done
+
+    local init_cmd="exec bash"
+    if [ -n "$POST_CREATE" ]; then
+        init_cmd="echo '>>> Running postCreateCommand...' && $POST_CREATE; exec bash"
+    fi
+
+    exec docker run -it --name "$CONTAINER" \
+        -v "$workspace:/workspace" \
+        "${mount_args[@]+"${mount_args[@]}"}" \
+        -w /workspace \
+        "$IMAGE" \
+        bash -c "$init_cmd"
+}
+
+# --connect mode: called inside the tmux window
+if [ "${1:-}" = "--connect" ]; then
+    do_connect "$2"
+fi
+
+# --- Main: resolve repo, build image, open tmux window ---
+
+WORKSPACE="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "Error: not inside a git repository" >&2
+    exit 1
+}
+
+DOCKERFILE="$WORKSPACE/.devcontainer/Dockerfile"
+if [ ! -f "$DOCKERFILE" ]; then
+    echo "Error: no .devcontainer/Dockerfile in $WORKSPACE" >&2
+    exit 1
+fi
+
+derive_names "$WORKSPACE"
+
+# Compute hash of devcontainer config files to detect changes
+DEVCONTAINER_HASH="$({ find "$WORKSPACE/.devcontainer" -type f ! -name '*.dockerignore' | sort | xargs cat; cat "$WORKSPACE/api/requirements.txt" "$WORKSPACE/api/requirements-dev.txt"; } | shasum -a 256 | cut -d' ' -f1)"
+EXISTING_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "devcontainer.hash"}}' 2>/dev/null || true)"
+
+if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
+    echo "Building devcontainer image '$IMAGE'..."
+    docker build -t "$IMAGE" --label "devcontainer.hash=$DEVCONTAINER_HASH" \
+        -f "$DOCKERFILE" "$WORKSPACE"
+    # Remove stale container so it gets recreated with the new image
+    docker rm -f "$CONTAINER" 2>/dev/null || true
+fi
+
+# Resolve this script's absolute path for the tmux command
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+tmux new-window -n "dev:$(basename "$WORKSPACE")" "\"$SCRIPT_PATH\" --connect \"$WORKSPACE\""

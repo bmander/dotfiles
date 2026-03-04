@@ -1,0 +1,40 @@
+#!/bin/bash
+set -e
+
+ISSUE=$1
+
+if [ -z "$ISSUE" ]; then
+  echo "Usage: dispatch <issue-number>"
+  exit 1
+fi
+
+# Check if a worktree already exists for this issue
+WORKTREE=$(git worktree list | grep "/${ISSUE}-" | awk '{print $1}')
+
+if [ -z "$WORKTREE" ]; then
+  REPO_ROOT=$(git rev-parse --show-toplevel)
+  WORKTREE_DIR=$(dirname "$REPO_ROOT")
+  # Fetch the issue title from GitHub and slugify it for the branch name
+  TITLE=$(gh issue view "$ISSUE" --json title -q '.title')
+  SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+  BRANCH="${ISSUE}-${SLUG}"
+  WORKTREE="${WORKTREE_DIR}/${BRANCH}"
+  echo "Creating worktree for issue #$ISSUE..."
+  git worktree add "$WORKTREE" -b "$BRANCH"
+
+  # Copy root .env to the new worktree if it exists
+  if [ -f "$REPO_ROOT/.env" ]; then
+    cp "$REPO_ROOT/.env" "$WORKTREE/.env"
+    echo "Copied .env to worktree"
+  fi
+fi
+
+BRANCH=$(basename "$WORKTREE")
+
+# Rename the tmux window to the first 16 chars of the branch for quick navigation
+if [ -n "$TMUX" ]; then
+  tmux rename-window "$(echo "$BRANCH" | cut -c1-16)"
+fi
+
+# Launch Claude Code in the worktree, pre-loaded with the issue context
+cd "$WORKTREE" && claude "/work-issue $ISSUE"
