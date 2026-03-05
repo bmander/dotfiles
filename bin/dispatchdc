@@ -56,7 +56,14 @@ build_dc_image() {
 FROM $base_image
 RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \\
     mkdir -p /home/vscode/.local/bin && \\
-    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude
+    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude && \\
+    mkdir -p /etc/apt/keyrings && \\
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \\
+    echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \\
+    apt-get update -qq && apt-get install -y -qq gh && \\
+    rm -rf /var/lib/apt/lists/*
 COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
 USER vscode
 EOF
