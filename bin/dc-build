@@ -40,21 +40,30 @@ case "$cmd" in
 esac
 GHEOF
 
+    cp "$(dirname "$(readlink -f "$0")")/init-firewall.sh" "$tmpdir/init-firewall.sh"
+
     cat > "$tmpdir/Dockerfile" <<EOF
 FROM $base_image
-RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \
-    mkdir -p /home/vscode/.local/bin && \
-    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude && \
-    mkdir -p /etc/apt/keyrings && \
+RUN if ! command -v node >/dev/null 2>&1; then \
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+        apt-get install -y -qq nodejs; \
+    fi && \
+    npm install -g @anthropic-ai/claude-code
+RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update -qq && apt-get install -y -qq gh && \
+    apt-get update -qq && apt-get install -y -qq sudo iptables ipset iproute2 dnsutils jq gh && \
     rm -rf /var/lib/apt/lists/* && \
     mv /usr/bin/gh /usr/bin/gh-real
 COPY gh-sandbox /usr/bin/gh
 RUN chmod 755 /usr/bin/gh
+COPY init-firewall.sh /usr/local/bin/init-firewall.sh
+RUN chmod 755 /usr/local/bin/init-firewall.sh && \
+    echo "vscode ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" \
+      > /etc/sudoers.d/firewall && \
+    chmod 440 /etc/sudoers.d/firewall
 COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
 USER vscode
 EOF

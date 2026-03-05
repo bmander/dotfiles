@@ -104,6 +104,7 @@ init_cmd="$init_cmd && echo $(printf '%q' "$SETTINGS_JSON") > ~/.claude/settings
 if [ -n "$POST_CREATE" ]; then
     init_cmd="$init_cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
 fi
+init_cmd="$init_cmd && echo '>>> Initializing network firewall...' && sudo /usr/local/bin/init-firewall.sh"
 init_cmd="$init_cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $ISSUE\""
 
 if [ ! -d "$WORKTREE" ]; then
@@ -112,6 +113,8 @@ if [ ! -d "$WORKTREE" ]; then
 fi
 
 exec docker run -it --name "$CONTAINER" \
+    --cap-add=NET_ADMIN \
+    --cap-add=NET_RAW \
     -v "$WORKTREE:/workspace" \
     -v "$REPO_ROOT/.git:/git" \
     -v "$REPO_ROOT/.git/config:/git/config:ro" \
