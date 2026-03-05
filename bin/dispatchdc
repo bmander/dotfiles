@@ -7,10 +7,12 @@ set -euo pipefail
 #
 # Usage: dispatchdc <issue-number>
 
+slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//'; }
+
 derive_names() {
     local repo_root="$1" branch="$2"
     local slug
-    slug="$(basename "$repo_root" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+    slug="$(slugify "$(basename "$repo_root")")"
     IMAGE="devcontainer-${slug}"
     DC_IMAGE="devcontainer-${slug}-dc"
     CONTAINER="devcontainer-${branch}"
@@ -94,16 +96,6 @@ do_connect() {
     local worktree
     worktree="$(dirname "$repo_root")/$branch"
 
-    local token_args=()
-    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-        token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-    fi
-    local gh_token
-    gh_token="$(gh auth token 2>/dev/null || true)"
-    if [ -n "$gh_token" ]; then
-        token_args+=(-e "GH_TOKEN=$gh_token")
-    fi
-
     local git_env_args=(
         -e "GIT_DIR=/git/worktrees/$branch"
         -e "GIT_COMMON_DIR=/git"
@@ -115,7 +107,6 @@ do_connect() {
     if [ "$state" = "true" ]; then
         # Container is running — exec bash for reconnect
         exec docker exec -it \
-            "${token_args[@]+"${token_args[@]}"}" \
             "${git_env_args[@]}" \
             "$CONTAINER" bash
     elif [ -n "$state" ]; then
@@ -123,9 +114,15 @@ do_connect() {
         docker rm "$CONTAINER" >/dev/null 2>&1 || true
     fi
 
-    # First run (or recreate) — build DC image if needed, then create container
-    if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
-        build_dc_image "$IMAGE" "$DC_IMAGE"
+    # New container path — gather credentials and build init payload
+    local token_args=()
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+    fi
+    local gh_token
+    gh_token="$(gh auth token 2>/dev/null || true)"
+    if [ -n "$gh_token" ]; then
+        token_args+=(-e "GH_TOKEN=$gh_token")
     fi
 
     local mount_args=()
@@ -133,20 +130,14 @@ do_connect() {
         mount_args+=(--mount "$m")
     done
 
-    local claude_seed
-    claude_seed="$(python3 -c "
-import json, sys
+    local lines
+    mapfile -t lines < <(python3 -c "
+import json
 with open('$HOME/.claude.json') as f:
     d = json.load(f)
 seed = {k: d[k] for k in ('oauthAccount','hasCompletedOnboarding','lastOnboardingVersion','userID','opusProMigrationComplete','sonnet1m45MigrationComplete') if k in d}
 seed['numStartups'] = 1
 seed['projects'] = {'/workspace': {'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {}, 'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [], 'hasTrustDialogAccepted': True}}
-print(json.dumps(seed))
-")" || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
-
-    local settings_json
-    settings_json="$(python3 -c "
-import json
 s = {
     'model': 'claude-opus-4-6',
     'skipDangerousModePermissionPrompt': True,
@@ -155,8 +146,10 @@ s = {
         'GIT_COMMON_DIR': '/git'
     }
 }
+print(json.dumps(seed))
 print(json.dumps(s))
-")"
+" 2>/dev/null) || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
+    local claude_seed="${lines[0]}" settings_json="${lines[1]}"
 
     # init_cmd runs as vscode (set in DC_IMAGE). HOME=/home/vscode.
     local init_cmd
@@ -221,7 +214,7 @@ WORKTREE="$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' ||
 if [ -z "$WORKTREE" ]; then
     WORKTREE_DIR="$(dirname "$REPO_ROOT")"
     TITLE="$(gh issue view "$ISSUE" --json title -q '.title')"
-    SLUG="$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+    SLUG="$(slugify "$TITLE")"
     BRANCH="${ISSUE}-${SLUG}"
     WORKTREE="${WORKTREE_DIR}/${BRANCH}"
     echo "Creating worktree for issue #$ISSUE..."
