@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Opens a tmux window with Claude Code running inside a devcontainer, isolated
-# to a single git worktree. Builds the image and creates the container on first
-# use; reconnects to an existing container on subsequent runs.
+# Opens a tmux window with Claude Code running inside a devcontainer for a
+# fresh git worktree. Fails if a worktree for the issue already exists unless
+# --use-old-worktree is passed.
 #
-# Usage: dispatchdc <issue-number>
+# Usage: dispatchdc <issue-number> [--use-old-worktree]
 
 source "$(dirname "$(readlink -f "$0")")/dc-lib"
 
-ISSUE="${1:-}"
+USE_OLD_WORKTREE=0
+ISSUE=""
+for arg in "$@"; do
+    case "$arg" in
+        --use-old-worktree) USE_OLD_WORKTREE=1 ;;
+        *) ISSUE="$arg" ;;
+    esac
+done
+
 if [ -z "$ISSUE" ]; then
-    echo "Usage: dispatchdc <issue-number>"
+    echo "Usage: dispatchdc <issue-number> [--use-old-worktree]"
     exit 1
 fi
 
@@ -40,7 +48,13 @@ fi
 # Find or create worktree for this issue
 WORKTREE="$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' || true)"
 
-if [ -z "$WORKTREE" ]; then
+if [ -n "$WORKTREE" ]; then
+    if [ "$USE_OLD_WORKTREE" -eq 0 ]; then
+        echo "Error: worktree already exists at $WORKTREE" >&2
+        echo "To reuse it, run: dispatchdc $ISSUE --use-old-worktree" >&2
+        exit 1
+    fi
+else
     TITLE="$(gh issue view "$ISSUE" --json title -q '.title')"
     BRANCH="${ISSUE}-$(slugify "$TITLE")"
     WORKTREE="$(dirname "$REPO_ROOT")/$BRANCH"
