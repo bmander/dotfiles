@@ -14,7 +14,12 @@ ISSUE=""
 for arg in "$@"; do
     case "$arg" in
         --use-old-worktree) USE_OLD_WORKTREE=1 ;;
-        *) ISSUE="$arg" ;;
+        *)
+            if [ -n "$ISSUE" ]; then
+                echo "Usage: dispatchdc <issue-number> [--use-old-worktree]" >&2
+                exit 1
+            fi
+            ISSUE="$arg" ;;
     esac
 done
 
