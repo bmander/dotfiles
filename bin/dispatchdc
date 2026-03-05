@@ -52,6 +52,16 @@ build_dc_image() {
         mkdir "$tmpdir/commands"
     fi
 
+    # Wrapper script: restrict gh to issue and pr subcommands only
+    cat > "$tmpdir/gh-sandbox" <<'GHEOF'
+#!/usr/bin/env bash
+cmd="${1:-}"
+case "$cmd" in
+    issue|pr) exec /usr/bin/gh-real "$@" ;;
+    *) echo "gh: '$cmd' is not permitted in this sandbox (allowed: issue, pr)" >&2; exit 1 ;;
+esac
+GHEOF
+
     cat > "$tmpdir/Dockerfile" <<EOF
 FROM $base_image
 RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \\
@@ -63,7 +73,10 @@ RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/clau
     echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list && \\
     apt-get update -qq && apt-get install -y -qq gh && \\
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \\
+    mv /usr/bin/gh /usr/bin/gh-real
+COPY gh-sandbox /usr/bin/gh
+RUN chmod 755 /usr/bin/gh
 COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
 USER vscode
 EOF
@@ -83,6 +96,11 @@ do_connect() {
     local token_args=()
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
         token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+    fi
+    local gh_token
+    gh_token="$(gh auth token 2>/dev/null || true)"
+    if [ -n "$gh_token" ]; then
+        token_args+=(-e "GH_TOKEN=$gh_token")
     fi
 
     local git_env_args=(
