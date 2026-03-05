@@ -1,7 +1,7 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-ISSUE=$1
+ISSUE="${1:-}"
 
 if [ -z "$ISSUE" ]; then
   echo "Usage: dispatch <issue-number>"
@@ -9,7 +9,7 @@ if [ -z "$ISSUE" ]; then
 fi
 
 # Check if a worktree already exists for this issue
-WORKTREE=$(git worktree list | grep "/${ISSUE}-" | awk '{print $1}')
+WORKTREE=$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}')
 
 if [ -z "$WORKTREE" ]; then
   REPO_ROOT=$(git rev-parse --show-toplevel)
@@ -32,9 +32,9 @@ fi
 BRANCH=$(basename "$WORKTREE")
 
 # Rename the tmux window to the first 16 chars of the branch for quick navigation
-if [ -n "$TMUX" ]; then
-  tmux rename-window "$(echo "$BRANCH" | cut -c1-16)"
+if [ -n "${TMUX:-}" ]; then
+  tmux rename-window "${BRANCH:0:16}"
 fi
 
 # Launch Claude Code in the worktree, pre-loaded with the issue context
-cd "$WORKTREE" && claude "/work-issue $ISSUE"
+cd "$WORKTREE" && exec claude "/work-issue $ISSUE"
