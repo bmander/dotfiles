@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Connects to (or creates) a GCE VM running a devcontainer with Claude Code.
+# If the VM and container are already running, SSH execs into it.
+# Otherwise creates/starts the VM and launches a fresh container.
+#
+# Usage: cloud-connect <repo_root> <branch> <issue>
+
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
+
+REPO_ROOT="${1:?Usage: cloud-connect <repo_root> <branch> <issue>}"
+BRANCH="${2:?Missing branch}"
+ISSUE="${3:?Missing issue}"
+
+derive_names "$REPO_ROOT" "$BRANCH"
+derive_cloud_names
+
+SSH_CMD=(gcloud compute ssh "$VM_NAME" --project="$GCP_PROJECT" --zone="$GCP_ZONE" --)
+
+wait_for_ssh() {
+    echo "Waiting for SSH access to $VM_NAME..."
+    local attempt=0
+    while [ $attempt -lt 30 ]; do
+        if gcloud compute ssh "$VM_NAME" --project="$GCP_PROJECT" --zone="$GCP_ZONE" -- "true" 2>/dev/null; then
+            echo "SSH connection established."
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    echo "Error: timed out waiting for SSH" >&2
+    exit 1
+}
+
+pull_image() {
+    echo "Pulling container image on VM..."
+    "${SSH_CMD[@]}" "docker-credential-gcr configure-docker --registries=$AR_HOST && docker pull $AR_IMAGE:latest"
+}
+
+create_vm() {
+    echo "Creating VM $VM_NAME..."
+    gcloud compute instances create "$VM_NAME" \
+        --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
+        --machine-type="$GCP_MACHINE_TYPE" \
+        --image-family=cos-stable --image-project=cos-cloud \
+        --boot-disk-size=50GB \
+        --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/compute \
+        --metadata=startup-script='#!/bin/bash
+nohup bash -c "sleep 28800 && shutdown -h now" &>/dev/null &'
+}
+
+# Prepare credentials and build init_cmd (called only for new container paths)
+prepare_and_run() {
+    get_github_remote
+    parse_devcontainer_json "$REPO_ROOT"
+    gather_credentials
+    generate_claude_seed  # no branch arg → no GIT_DIR/GIT_COMMON_DIR in settings
+
+    local workspace_setup="sudo mkdir -p /workspace && sudo chown \$(id -u):\$(id -g) /workspace"
+    workspace_setup="$workspace_setup && git clone https://x-access-token:\$GH_TOKEN@github.com/${GITHUB_REMOTE}.git /workspace"
+    workspace_setup="$workspace_setup && cd /workspace && git checkout -b $BRANCH"
+    workspace_setup="$workspace_setup && git config user.name $(printf '%q' "$git_name")"
+    workspace_setup="$workspace_setup && git config user.email $(printf '%q' "$git_email")"
+
+    local init_cmd env_args
+    init_cmd="$(build_init_cmd "$ISSUE" "$workspace_setup")"
+    env_args="$(token_args_string)"
+
+    # After docker exits, self-delete the VM via GCE metadata API
+    local self_delete
+    self_delete="TOKEN=\$(curl -sf -H 'Metadata-Flavor: Google' \
+'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+| grep -o '\"access_token\":\"[^\"]*\"' | cut -d'\"' -f4) && \
+curl -sf -X DELETE -H \"Authorization: Bearer \$TOKEN\" \
+'https://compute.googleapis.com/compute/v1/projects/$GCP_PROJECT/zones/$GCP_ZONE/instances/$VM_NAME' && \
+echo 'VM self-delete requested.' || echo 'VM self-delete failed (clean up manually).'"
+
+    exec "${SSH_CMD[@]}" -t \
+        "docker run -it --name $CONTAINER \
+            --cap-add=NET_ADMIN --cap-add=NET_RAW \
+            $env_args \
+            -w /workspace \
+            $AR_IMAGE:latest \
+            bash -c $(printf '%q' "$init_cmd"); \
+         echo '>>> Claude exited. Deleting VM...'; $self_delete"
+}
+
+# Check VM status
+VM_STATUS="$(gcloud compute instances describe "$VM_NAME" \
+    --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
+    --format='value(status)' 2>/dev/null || true)"
+
+case "$VM_STATUS" in
+    RUNNING)
+        # Check if container is alive
+        CONTAINER_STATE="$("${SSH_CMD[@]}" "docker container inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null" 2>/dev/null || true)"
+        if [ "$CONTAINER_STATE" = "true" ]; then
+            echo "Reconnecting to running container..."
+            exec "${SSH_CMD[@]}" -t "docker exec -it $CONTAINER bash"
+        fi
+        # Container stopped or missing — clean up and re-run
+        "${SSH_CMD[@]}" "docker rm $CONTAINER 2>/dev/null || true"
+        pull_image
+        prepare_and_run
+        ;;
+    TERMINATED)
+        echo "Starting stopped VM $VM_NAME..."
+        gcloud compute instances start "$VM_NAME" \
+            --project="$GCP_PROJECT" --zone="$GCP_ZONE"
+        wait_for_ssh
+        pull_image
+        prepare_and_run
+        ;;
+    "")
+        # VM doesn't exist
+        create_vm
+        wait_for_ssh
+        pull_image
+        prepare_and_run
+        ;;
+    *)
+        echo "Error: VM $VM_NAME is in unexpected state: $VM_STATUS" >&2
+        exit 1
+        ;;
+esac

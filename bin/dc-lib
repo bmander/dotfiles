@@ -10,3 +10,145 @@ derive_names() {
     DC_IMAGE="devcontainer-${slug}-dc"
     CONTAINER="devcontainer-${branch}"
 }
+
+require_dispatch_prereqs() {
+    if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        echo "Error: CLAUDE_CODE_OAUTH_TOKEN is not set." >&2
+        echo "Run 'claude setup-token' to generate a token, then add to your shell profile:" >&2
+        echo "  export CLAUDE_CODE_OAUTH_TOKEN=\"sk-ant-oat01-...\"" >&2
+        exit 1
+    fi
+
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+        echo "Error: not inside a git repository" >&2
+        exit 1
+    }
+
+    if [ ! -f "$REPO_ROOT/.devcontainer/Dockerfile" ]; then
+        echo "Error: no .devcontainer/Dockerfile in $REPO_ROOT" >&2
+        exit 1
+    fi
+
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: not inside a tmux session" >&2
+        exit 1
+    fi
+}
+
+derive_branch_name() {
+    local issue="$1"
+    TITLE="$(gh issue view "$issue" --json title -q '.title')"
+    BRANCH="${issue}-$(slugify "$TITLE")"
+}
+
+parse_devcontainer_json() {
+    local repo_root="$1"
+    local config="$repo_root/.devcontainer/devcontainer.json"
+    MOUNTS=()
+    POST_CREATE=""
+    if [ -f "$config" ] && command -v python3 &>/dev/null; then
+        eval "$(python3 -c "
+import json, re, shlex
+with open('$config') as f:
+    text = re.sub(r'//.*', '', f.read())
+    cfg = json.loads(text)
+mounts = cfg.get('mounts', [])
+for i, m in enumerate(mounts):
+    print(f'MOUNTS[{i}]={shlex.quote(m)}')
+pc = cfg.get('postCreateCommand', '')
+print(f'POST_CREATE={shlex.quote(pc)}')
+" 2>/dev/null)"
+    fi
+}
+
+gather_credentials() {
+    token_args=()
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+    fi
+    gh_token="$(gh auth token 2>/dev/null || true)"
+    if [ -n "$gh_token" ]; then
+        token_args+=(-e "GH_TOKEN=$gh_token")
+    fi
+    git_name="$(git config --global user.name 2>/dev/null || true)"
+    git_email="$(git config --global user.email 2>/dev/null || true)"
+    if [ -n "$git_name" ]; then
+        token_args+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+    fi
+    if [ -n "$git_email" ]; then
+        token_args+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
+    fi
+}
+
+generate_claude_seed() {
+    local branch="${1:-}"
+    local env_block
+    if [ -n "$branch" ]; then
+        env_block="
+    'env': {
+        'GIT_DIR': '/git/worktrees/$branch',
+        'GIT_COMMON_DIR': '/git'
+    }"
+    else
+        env_block="'env': {}"
+    fi
+    local _json_out
+    _json_out="$(python3 -c "
+import json
+with open('$HOME/.claude.json') as f:
+    d = json.load(f)
+seed = {k: d[k] for k in ('oauthAccount','hasCompletedOnboarding','lastOnboardingVersion','userID','opusProMigrationComplete','sonnet1m45MigrationComplete') if k in d}
+seed['numStartups'] = 1
+seed['projects'] = {'/workspace': {'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {}, 'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [], 'hasTrustDialogAccepted': True}}
+s = {
+    'model': 'claude-opus-4-6',
+    'skipDangerousModePermissionPrompt': True,
+    $env_block
+}
+print(json.dumps(seed))
+print(json.dumps(s))
+" 2>/dev/null)" || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
+    CLAUDE_SEED="${_json_out%%$'\n'*}"
+    SETTINGS_JSON="${_json_out#*$'\n'}"
+}
+
+build_init_cmd() {
+    local issue="$1"
+    local workspace_setup="${2:-}"
+    local cmd="mkdir -p ~/.claude"
+    cmd="$cmd && echo $(printf '%q' "$CLAUDE_SEED") > ~/.claude.json"
+    cmd="$cmd && echo $(printf '%q' "$SETTINGS_JSON") > ~/.claude/settings.json"
+    if [ -n "$workspace_setup" ]; then
+        cmd="$cmd && $workspace_setup"
+    fi
+    if [ -n "$POST_CREATE" ]; then
+        cmd="$cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
+    fi
+    cmd="$cmd && echo '>>> Initializing network firewall...' && sudo /usr/local/bin/init-firewall.sh"
+    cmd="$cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $issue\""
+    echo "$cmd"
+}
+
+token_args_string() {
+    printf '%q ' "${token_args[@]+"${token_args[@]}"}"
+}
+
+get_github_remote() {
+    local url
+    url="$(git remote get-url origin 2>/dev/null)"
+    # Handle SSH (git@github.com:owner/repo.git) and HTTPS (https://github.com/owner/repo.git)
+    GITHUB_REMOTE="$(echo "$url" | sed -E 's#(git@github\.com:|https://github\.com/)##;s#\.git$##')"
+}
+
+derive_cloud_names() {
+    : "${DC_IMAGE:?derive_cloud_names requires derive_names to be called first}"
+    : "${CONTAINER:?derive_cloud_names requires derive_names to be called first}"
+    GCP_PROJECT="${DISPATCHDC_GCP_PROJECT:?Error: DISPATCHDC_GCP_PROJECT is not set}"
+    GCP_ZONE="${DISPATCHDC_GCP_ZONE:-us-central1-a}"
+    GCP_REGION="${DISPATCHDC_GCP_REGION:-${GCP_ZONE%-*}}"
+    GCP_MACHINE_TYPE="${DISPATCHDC_GCP_MACHINE_TYPE:-e2-standard-4}"
+    AR_HOST="${GCP_REGION}-docker.pkg.dev"
+    AR_REPO="${GCP_PROJECT}/devcontainers"
+    AR_IMAGE="${AR_HOST}/${AR_REPO}/${DC_IMAGE}"
+    VM_NAME="dc-${CONTAINER}"
+}

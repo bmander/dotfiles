@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Opens a tmux window with Claude Code running inside a devcontainer on a
+# GCE VM. The container clones the repo via git (no local worktree needed).
+#
+# Usage: dispatch-cloud <issue-number>
+#
+# Required env: DISPATCHDC_GCP_PROJECT
+# Optional env: DISPATCHDC_GCP_ZONE (default: us-central1-a)
+#               DISPATCHDC_GCP_REGION (default: derived from zone)
+#               DISPATCHDC_GCP_MACHINE_TYPE (default: e2-standard-4)
+
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
+
+ISSUE="${1:?Usage: dispatch-cloud <issue-number>}"
+
+require_dispatch_prereqs
+
+if [ -z "${DISPATCHDC_GCP_PROJECT:-}" ]; then
+    echo "Error: DISPATCHDC_GCP_PROJECT is not set." >&2
+    exit 1
+fi
+
+if ! command -v gcloud &>/dev/null; then
+    echo "Error: gcloud CLI is not installed" >&2
+    exit 1
+fi
+
+derive_branch_name "$ISSUE"
+
+BIN="$(dirname "$(readlink -f "$0")")"
+"$BIN/dc-build" "$REPO_ROOT"
+
+# Derive cloud names (needs DC_IMAGE from derive_names)
+derive_names "$REPO_ROOT" "$BRANCH"
+derive_cloud_names
+
+# Ensure Artifact Registry repo exists
+gcloud artifacts repositories create devcontainers \
+    --repository-format=docker \
+    --location="$GCP_REGION" \
+    --project="$GCP_PROJECT" \
+    --quiet 2>/dev/null || true
+
+# Push image to Artifact Registry
+gcloud auth configure-docker "$AR_HOST" --quiet
+docker tag "$DC_IMAGE" "$AR_IMAGE:latest"
+docker push "$AR_IMAGE:latest"
+
+# Forward GCP env vars into the tmux window; keep shell open on crash for debugging
+tmux new-window -n "${BRANCH:0:16}" \
+    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \
+     DISPATCHDC_GCP_PROJECT=\"$GCP_PROJECT\" \
+     DISPATCHDC_GCP_ZONE=\"$GCP_ZONE\" \
+     DISPATCHDC_GCP_REGION=\"$GCP_REGION\" \
+     DISPATCHDC_GCP_MACHINE_TYPE=\"$GCP_MACHINE_TYPE\" \
+     \"$BIN/cloud-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\" || { echo '--- cloud-connect failed (exit \$?) — press Enter to close ---'; read; }"

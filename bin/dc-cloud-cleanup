@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deletes the GCE VM associated with a branch.
+#
+# Usage: dc-cloud-cleanup <repo_root> <branch>
+
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
+
+REPO_ROOT="${1:?Usage: dc-cloud-cleanup <repo_root> <branch>}"
+BRANCH="${2:?Missing branch}"
+
+derive_names "$REPO_ROOT" "$BRANCH"
+derive_cloud_names
+
+echo "Deleting VM $VM_NAME..."
+gcloud compute instances delete "$VM_NAME" \
+    --project="$GCP_PROJECT" --zone="$GCP_ZONE" --quiet
+echo "VM $VM_NAME deleted."

@@ -28,27 +28,7 @@ if [ -z "$ISSUE" ]; then
     exit 1
 fi
 
-if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    echo "Error: CLAUDE_CODE_OAUTH_TOKEN is not set." >&2
-    echo "Run 'claude setup-token' to generate a token, then add to your shell profile:" >&2
-    echo "  export CLAUDE_CODE_OAUTH_TOKEN=\"sk-ant-oat01-...\"" >&2
-    exit 1
-fi
-
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "Error: not inside a git repository" >&2
-    exit 1
-}
-
-if [ ! -f "$REPO_ROOT/.devcontainer/Dockerfile" ]; then
-    echo "Error: no .devcontainer/Dockerfile in $REPO_ROOT" >&2
-    exit 1
-fi
-
-if [ -z "${TMUX:-}" ]; then
-    echo "Error: not inside a tmux session" >&2
-    exit 1
-fi
+require_dispatch_prereqs
 
 # Find or create worktree for this issue
 WORKTREE="$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' || true)"
@@ -60,8 +40,7 @@ if [ -n "$WORKTREE" ]; then
         exit 1
     fi
 else
-    TITLE="$(gh issue view "$ISSUE" --json title -q '.title')"
-    BRANCH="${ISSUE}-$(slugify "$TITLE")"
+    derive_branch_name "$ISSUE"
     WORKTREE="$(dirname "$REPO_ROOT")/$BRANCH"
     echo "Creating worktree for issue #$ISSUE..."
     git worktree add "$WORKTREE" -b "$BRANCH"
@@ -77,4 +56,4 @@ BIN="$(dirname "$(readlink -f "$0")")"
 "$BIN/dc-build" "$REPO_ROOT"
 
 tmux new-window -n "${BRANCH:0:16}" \
-    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\""
+    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\" || { echo '--- dc-connect failed (exit \$?) — press Enter to close ---'; read; }"
