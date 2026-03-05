@@ -34,8 +34,6 @@ print(f'POST_CREATE={shlex.quote(pc)}')
     fi
 }
 
-parse_devcontainer_json
-
 WORKTREE="$(dirname "$REPO_ROOT")/$BRANCH"
 
 local_git_env_args=(
@@ -53,6 +51,8 @@ elif [ -n "$STATE" ]; then
     docker rm "$CONTAINER" >/dev/null 2>&1 || true
 fi
 
+parse_devcontainer_json
+
 # New container — gather credentials
 token_args=()
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
@@ -68,7 +68,6 @@ for m in "${MOUNTS[@]+"${MOUNTS[@]}"}"; do
     mount_args+=(--mount "$m")
 done
 
-lines=()
 mapfile -t lines < <(python3 -c "
 import json
 with open('$HOME/.claude.json') as f:
@@ -98,6 +97,11 @@ if [ -n "$POST_CREATE" ]; then
     init_cmd="$init_cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
 fi
 init_cmd="$init_cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $ISSUE\""
+
+if [ ! -d "$WORKTREE" ]; then
+    echo "Error: worktree directory not found: $WORKTREE" >&2
+    exit 1
+fi
 
 exec docker run -it --name "$CONTAINER" \
     -v "$WORKTREE:/workspace" \

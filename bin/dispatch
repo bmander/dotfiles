@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
+
 ISSUE="${1:-}"
 
 if [ -z "$ISSUE" ]; then
@@ -16,8 +18,7 @@ if [ -z "$WORKTREE" ]; then
   WORKTREE_DIR=$(dirname "$REPO_ROOT")
   # Fetch the issue title from GitHub and slugify it for the branch name
   TITLE=$(gh issue view "$ISSUE" --json title -q '.title')
-  SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
-  BRANCH="${ISSUE}-${SLUG}"
+  BRANCH="${ISSUE}-$(slugify "$TITLE")"
   WORKTREE="${WORKTREE_DIR}/${BRANCH}"
   echo "Creating worktree for issue #$ISSUE..."
   git worktree add "$WORKTREE" -b "$BRANCH"

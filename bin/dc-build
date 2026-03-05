@@ -17,9 +17,7 @@ if [ ! -f "$DOCKERFILE" ]; then
     exit 1
 fi
 
-SLUG="$(slugify "$(basename "$REPO_ROOT")")"
-IMAGE="devcontainer-${SLUG}"
-DC_IMAGE="devcontainer-${SLUG}-dc"
+derive_names "$REPO_ROOT" ""
 
 build_dc_image() {
     local base_image="$1" dc_image="$2"

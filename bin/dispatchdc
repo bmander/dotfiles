@@ -54,8 +54,8 @@ fi
 
 BRANCH="$(basename "$WORKTREE")"
 
-dc-build "$REPO_ROOT"
-
 BIN="$(dirname "$(readlink -f "$0")")"
+"$BIN/dc-build" "$REPO_ROOT"
+
 tmux new-window -n "${BRANCH:0:16}" \
     "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\""
