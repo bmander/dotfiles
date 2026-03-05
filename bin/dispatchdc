@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Opens a tmux window with a shell inside the devcontainer for the current
-# repo (or worktree). Builds the image and creates the container on first use.
+# Opens a tmux window with Claude Code running inside a devcontainer, isolated
+# to a single git worktree. Builds the image and creates the container on first
+# use; reconnects to an existing container on subsequent runs.
 #
-# Usage: cd into any repo with a .devcontainer/Dockerfile, then run:
-#   ~/devcontainer.sh
+# Usage: dispatchdc <issue-number>
 
 derive_names() {
-    local workspace="$1"
+    local repo_root="$1" branch="$2"
     local slug
-    slug="$(basename "$workspace" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+    slug="$(basename "$repo_root" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
     IMAGE="devcontainer-${slug}"
-    CONTAINER="devcontainer-${slug}"
+    DC_IMAGE="devcontainer-${slug}-dc"
+    CONTAINER="devcontainer-${branch}"
 }
 
 parse_devcontainer_json() {
-    local config="$1/.devcontainer/devcontainer.json"
+    local repo_root="$1"
+    local config="$repo_root/.devcontainer/devcontainer.json"
     MOUNTS=()
     POST_CREATE=""
     if [ -f "$config" ] && command -v python3 &>/dev/null; then
@@ -37,26 +39,69 @@ print(f'POST_CREATE={shlex.quote(pc)}')
     fi
 }
 
+build_dc_image() {
+    local base_image="$1" dc_image="$2"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap "rm -rf '$tmpdir'" RETURN
+
+    # Copy host claude commands into build context so they're baked into the image
+    if [ -d "$HOME/.claude/commands" ]; then
+        cp -r "$HOME/.claude/commands" "$tmpdir/commands"
+    else
+        mkdir "$tmpdir/commands"
+    fi
+
+    cat > "$tmpdir/Dockerfile" <<EOF
+FROM $base_image
+RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \\
+    mkdir -p /home/vscode/.local/bin && \\
+    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude
+COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
+USER vscode
+EOF
+
+    echo "Building dispatch wrapper image '$dc_image'..."
+    docker build -t "$dc_image" "$tmpdir"
+}
+
 do_connect() {
-    local workspace="$1"
-    derive_names "$workspace"
-    parse_devcontainer_json "$workspace"
+    local repo_root="$1" branch="$2" issue="$3"
+    derive_names "$repo_root" "$branch"
+    parse_devcontainer_json "$repo_root"
+
+    local worktree
+    worktree="$(dirname "$repo_root")/$branch"
 
     local token_args=()
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
         token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
     fi
 
+    local git_env_args=(
+        -e "GIT_DIR=/git/worktrees/$branch"
+        -e "GIT_COMMON_DIR=/git"
+    )
+
     local state
     state="$(docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+
     if [ "$state" = "true" ]; then
-        exec docker exec -it "${token_args[@]+"${token_args[@]}"}" "$CONTAINER" bash
+        # Container is running — exec bash for reconnect
+        exec docker exec -it \
+            "${token_args[@]+"${token_args[@]}"}" \
+            "${git_env_args[@]}" \
+            "$CONTAINER" bash
     elif [ -n "$state" ]; then
-        docker start "$CONTAINER" >/dev/null
-        exec docker exec -it "${token_args[@]+"${token_args[@]}"}" "$CONTAINER" bash
+        # Container exists but stopped — remove and recreate fresh
+        docker rm "$CONTAINER" >/dev/null 2>&1 || true
     fi
 
-    # First run — create the container
+    # First run (or recreate) — build DC image if needed, then create container
+    if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
+        build_dc_image "$IMAGE" "$DC_IMAGE"
+    fi
+
     local mount_args=()
     for m in "${MOUNTS[@]+"${MOUNTS[@]}"}"; do
         mount_args+=(--mount "$m")
@@ -67,32 +112,63 @@ do_connect() {
 import json, sys
 with open('$HOME/.claude.json') as f:
     d = json.load(f)
-seed = {k: d[k] for k in ('oauthAccount','hasCompletedOnboarding','lastOnboardingVersion','installMethod','userID','opusProMigrationComplete','sonnet1m45MigrationComplete') if k in d}
+seed = {k: d[k] for k in ('oauthAccount','hasCompletedOnboarding','lastOnboardingVersion','userID','opusProMigrationComplete','sonnet1m45MigrationComplete') if k in d}
 seed['numStartups'] = 1
 seed['projects'] = {'/workspace': {'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {}, 'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [], 'hasTrustDialogAccepted': True}}
 print(json.dumps(seed))
 ")" || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
-    local init_cmd="echo $(printf '%q' "$claude_seed") > /root/.claude.json && mkdir -p /root/.claude && echo '{\"model\":\"claude-opus-4-6\"}' > /root/.claude/settings.json"
+
+    local settings_json
+    settings_json="$(python3 -c "
+import json
+s = {
+    'model': 'claude-opus-4-6',
+    'skipDangerousModePermissionPrompt': True,
+    'env': {
+        'GIT_DIR': '/git/worktrees/$branch',
+        'GIT_COMMON_DIR': '/git'
+    }
+}
+print(json.dumps(s))
+")"
+
+    # init_cmd runs as vscode (set in DC_IMAGE). HOME=/home/vscode.
+    local init_cmd
+    init_cmd="mkdir -p ~/.claude"
+    init_cmd="$init_cmd && echo $(printf '%q' "$claude_seed") > ~/.claude.json"
+    init_cmd="$init_cmd && echo $(printf '%q' "$settings_json") > ~/.claude/settings.json"
     if [ -n "$POST_CREATE" ]; then
-        init_cmd="$init_cmd && echo '>>> Running postCreateCommand...' && $POST_CREATE"
+        init_cmd="$init_cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
     fi
-    init_cmd="$init_cmd; exec bash"
+    init_cmd="$init_cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $issue\""
 
     exec docker run -it --name "$CONTAINER" \
-        -v "$workspace:/workspace" \
+        -v "$worktree:/workspace" \
+        -v "$repo_root/.git:/git" \
+        -v "$repo_root/.devcontainer:/workspace/.devcontainer:ro" \
         "${token_args[@]+"${token_args[@]}"}" \
+        "${git_env_args[@]}" \
         "${mount_args[@]+"${mount_args[@]}"}" \
         -w /workspace \
-        "$IMAGE" \
+        "$DC_IMAGE" \
         bash -c "$init_cmd"
 }
 
 # --connect mode: called inside the tmux window
 if [ "${1:-}" = "--connect" ]; then
-    do_connect "${2:?Usage: dispatchdc --connect <workspace>}"
+    do_connect "${2:?Usage: dispatchdc --connect <repo_root> <branch> <issue>}" \
+               "${3:?Missing branch}" \
+               "${4:?Missing issue}"
+    exit 0
 fi
 
-# --- Main: resolve repo, build image, open tmux window ---
+# --- Main: resolve repo, create worktree, build image, open tmux window ---
+
+ISSUE="${1:-}"
+if [ -z "$ISSUE" ]; then
+    echo "Usage: dispatchdc <issue-number>"
+    exit 1
+fi
 
 if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     echo "Error: CLAUDE_CODE_OAUTH_TOKEN is not set." >&2
@@ -101,36 +177,61 @@ if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     exit 1
 fi
 
-WORKSPACE="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
     echo "Error: not inside a git repository" >&2
     exit 1
 }
 
-DOCKERFILE="$WORKSPACE/.devcontainer/Dockerfile"
+DOCKERFILE="$REPO_ROOT/.devcontainer/Dockerfile"
 if [ ! -f "$DOCKERFILE" ]; then
-    echo "Error: no .devcontainer/Dockerfile in $WORKSPACE" >&2
+    echo "Error: no .devcontainer/Dockerfile in $REPO_ROOT" >&2
     exit 1
 fi
 
-derive_names "$WORKSPACE"
+# Check if a worktree already exists for this issue
+WORKTREE="$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' || true)"
+
+if [ -z "$WORKTREE" ]; then
+    WORKTREE_DIR="$(dirname "$REPO_ROOT")"
+    TITLE="$(gh issue view "$ISSUE" --json title -q '.title')"
+    SLUG="$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+    BRANCH="${ISSUE}-${SLUG}"
+    WORKTREE="${WORKTREE_DIR}/${BRANCH}"
+    echo "Creating worktree for issue #$ISSUE..."
+    git worktree add "$WORKTREE" -b "$BRANCH"
+
+    if [ -f "$REPO_ROOT/.env" ]; then
+        cp "$REPO_ROOT/.env" "$WORKTREE/.env"
+        echo "Copied .env to worktree"
+    fi
+fi
+
+BRANCH="$(basename "$WORKTREE")"
+
+derive_names "$REPO_ROOT" "$BRANCH"
 
 # Compute hash of devcontainer config files to detect changes
 HASH_FILES=()
-for f in "$WORKSPACE/api/requirements.txt" "$WORKSPACE/api/requirements-dev.txt"; do
+for f in "$REPO_ROOT/api/requirements.txt" "$REPO_ROOT/api/requirements-dev.txt"; do
     [ -f "$f" ] && HASH_FILES+=("$f")
 done
-DEVCONTAINER_HASH="$({ find "$WORKSPACE/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}"; } | shasum -a 256 | cut -d' ' -f1)"
+DEVCONTAINER_HASH="$({ find "$REPO_ROOT/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}"; } | shasum -a 256 | cut -d' ' -f1)"
 EXISTING_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "devcontainer.hash"}}' 2>/dev/null || true)"
 
 if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
     echo "Building devcontainer image '$IMAGE'..."
     docker build -t "$IMAGE" --label "devcontainer.hash=$DEVCONTAINER_HASH" \
-        -f "$DOCKERFILE" "$WORKSPACE"
-    # Remove stale container so it gets recreated with the new image
+        -f "$DOCKERFILE" "$REPO_ROOT"
+    # Base changed — remove stale DC wrapper and container
+    docker rmi "$DC_IMAGE" 2>/dev/null || true
     docker rm -f "$CONTAINER" 2>/dev/null || true
 fi
 
-# Resolve this script's absolute path for the tmux command
+# Build DC wrapper image if it doesn't exist
+if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
+    build_dc_image "$IMAGE" "$DC_IMAGE"
+fi
+
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 if [ -z "${TMUX:-}" ]; then
@@ -138,4 +239,5 @@ if [ -z "${TMUX:-}" ]; then
     exit 1
 fi
 
-tmux new-window -n "dev:$(basename "$WORKSPACE")" "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$SCRIPT_PATH\" --connect \"$WORKSPACE\""
+tmux new-window -n "${BRANCH:0:16}" \
+    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$SCRIPT_PATH\" --connect \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\""
