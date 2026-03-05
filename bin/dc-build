@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ensures devcontainer images are current for a repo.
+# Builds the base image if the devcontainer config has changed, then builds
+# (or rebuilds) the dispatch wrapper image on top.
+#
+# Usage: dc-build <repo_root>
+
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
+
+REPO_ROOT="${1:?Usage: dc-build <repo_root>}"
+
+DOCKERFILE="$REPO_ROOT/.devcontainer/Dockerfile"
+if [ ! -f "$DOCKERFILE" ]; then
+    echo "Error: no .devcontainer/Dockerfile in $REPO_ROOT" >&2
+    exit 1
+fi
+
+SLUG="$(slugify "$(basename "$REPO_ROOT")")"
+IMAGE="devcontainer-${SLUG}"
+DC_IMAGE="devcontainer-${SLUG}-dc"
+
+build_dc_image() {
+    local base_image="$1" dc_image="$2"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap "rm -rf '$tmpdir'" RETURN
+
+    if [ -d "$HOME/.claude/commands" ]; then
+        cp -r "$HOME/.claude/commands" "$tmpdir/commands"
+    else
+        mkdir "$tmpdir/commands"
+    fi
+
+    cat > "$tmpdir/gh-sandbox" <<'GHEOF'
+#!/usr/bin/env bash
+cmd="${1:-}"
+case "$cmd" in
+    issue|pr) exec /usr/bin/gh-real "$@" ;;
+    *) echo "gh: '$cmd' is not permitted in this sandbox (allowed: issue, pr)" >&2; exit 1 ;;
+esac
+GHEOF
+
+    cat > "$tmpdir/Dockerfile" <<EOF
+FROM $base_image
+RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \
+    mkdir -p /home/vscode/.local/bin && \
+    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update -qq && apt-get install -y -qq gh && \
+    rm -rf /var/lib/apt/lists/* && \
+    mv /usr/bin/gh /usr/bin/gh-real
+COPY gh-sandbox /usr/bin/gh
+RUN chmod 755 /usr/bin/gh
+COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
+USER vscode
+EOF
+
+    echo "Building dispatch wrapper image '$dc_image'..."
+    docker build -t "$dc_image" "$tmpdir"
+}
+
+# Compute hash of devcontainer config + python dependency files
+HASH_FILES=()
+for f in "$REPO_ROOT/api/requirements.txt" "$REPO_ROOT/api/requirements-dev.txt"; do
+    [ -f "$f" ] && HASH_FILES+=("$f")
+done
+DEVCONTAINER_HASH="$({ find "$REPO_ROOT/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}"; } | shasum -a 256 | cut -d' ' -f1)"
+EXISTING_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "devcontainer.hash"}}' 2>/dev/null || true)"
+
+if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
+    echo "Building devcontainer image '$IMAGE'..."
+    docker build -t "$IMAGE" --label "devcontainer.hash=$DEVCONTAINER_HASH" \
+        -f "$DOCKERFILE" "$REPO_ROOT"
+    # Base changed — remove stale DC wrapper (containers are recreated by dc-connect)
+    docker rmi "$DC_IMAGE" 2>/dev/null || true
+fi
+
+if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
+    build_dc_image "$IMAGE" "$DC_IMAGE"
+fi

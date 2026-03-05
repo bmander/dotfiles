@@ -1,0 +1,12 @@
+# dc-lib: shared helpers for dc-* scripts. Source this file; do not execute it.
+
+slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//'; }
+
+derive_names() {
+    local repo_root="$1" branch="$2"
+    local slug
+    slug="$(slugify "$(basename "$repo_root")")"
+    IMAGE="devcontainer-${slug}"
+    DC_IMAGE="devcontainer-${slug}-dc"
+    CONTAINER="devcontainer-${branch}"
+}

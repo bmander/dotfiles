@@ -7,182 +7,7 @@ set -euo pipefail
 #
 # Usage: dispatchdc <issue-number>
 
-slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//'; }
-
-derive_names() {
-    local repo_root="$1" branch="$2"
-    local slug
-    slug="$(slugify "$(basename "$repo_root")")"
-    IMAGE="devcontainer-${slug}"
-    DC_IMAGE="devcontainer-${slug}-dc"
-    CONTAINER="devcontainer-${branch}"
-}
-
-parse_devcontainer_json() {
-    local repo_root="$1"
-    local config="$repo_root/.devcontainer/devcontainer.json"
-    MOUNTS=()
-    POST_CREATE=""
-    if [ -f "$config" ] && command -v python3 &>/dev/null; then
-        eval "$(python3 -c "
-import json, re, shlex
-
-with open('$config') as f:
-    text = re.sub(r'//.*', '', f.read())
-    cfg = json.loads(text)
-
-mounts = cfg.get('mounts', [])
-for i, m in enumerate(mounts):
-    print(f'MOUNTS[{i}]={shlex.quote(m)}')
-
-pc = cfg.get('postCreateCommand', '')
-print(f'POST_CREATE={shlex.quote(pc)}')
-" 2>/dev/null)"
-    fi
-}
-
-build_dc_image() {
-    local base_image="$1" dc_image="$2"
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    trap "rm -rf '$tmpdir'" RETURN
-
-    # Copy host claude commands into build context so they're baked into the image
-    if [ -d "$HOME/.claude/commands" ]; then
-        cp -r "$HOME/.claude/commands" "$tmpdir/commands"
-    else
-        mkdir "$tmpdir/commands"
-    fi
-
-    # Wrapper: restrict gh to issue and pr subcommands only
-    cat > "$tmpdir/gh-sandbox" <<'GHEOF'
-#!/usr/bin/env bash
-cmd="${1:-}"
-case "$cmd" in
-    issue|pr) exec /usr/bin/gh-real "$@" ;;
-    *) echo "gh: '$cmd' is not permitted in this sandbox (allowed: issue, pr)" >&2; exit 1 ;;
-esac
-GHEOF
-
-
-    cat > "$tmpdir/Dockerfile" <<EOF
-FROM $base_image
-RUN install -m 755 "\$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && \\
-    mkdir -p /home/vscode/.local/bin && \\
-    ln -sf /usr/local/bin/claude /home/vscode/.local/bin/claude && \\
-    mkdir -p /etc/apt/keyrings && \\
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \\
-    echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list && \\
-    apt-get update -qq && apt-get install -y -qq gh && \\
-    rm -rf /var/lib/apt/lists/* && \\
-    mv /usr/bin/gh /usr/bin/gh-real
-COPY gh-sandbox /usr/bin/gh
-RUN chmod 755 /usr/bin/gh
-COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
-USER vscode
-EOF
-
-    echo "Building dispatch wrapper image '$dc_image'..."
-    docker build -t "$dc_image" "$tmpdir"
-}
-
-do_connect() {
-    local repo_root="$1" branch="$2" issue="$3"
-    derive_names "$repo_root" "$branch"
-    parse_devcontainer_json "$repo_root"
-
-    local worktree
-    worktree="$(dirname "$repo_root")/$branch"
-
-    local git_env_args=(
-        -e "GIT_DIR=/git/worktrees/$branch"
-        -e "GIT_COMMON_DIR=/git"
-    )
-
-    local state
-    state="$(docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
-
-    if [ "$state" = "true" ]; then
-        # Container is running — exec bash for reconnect
-        exec docker exec -it \
-            "${git_env_args[@]}" \
-            "$CONTAINER" bash
-    elif [ -n "$state" ]; then
-        # Container exists but stopped — remove and recreate fresh
-        docker rm "$CONTAINER" >/dev/null 2>&1 || true
-    fi
-
-    # New container path — gather credentials and build init payload
-    local token_args=()
-    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-        token_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-    fi
-    local gh_token
-    gh_token="$(gh auth token 2>/dev/null || true)"
-    if [ -n "$gh_token" ]; then
-        token_args+=(-e "GH_TOKEN=$gh_token")
-    fi
-
-    local mount_args=()
-    for m in "${MOUNTS[@]+"${MOUNTS[@]}"}"; do
-        mount_args+=(--mount "$m")
-    done
-
-    local lines
-    mapfile -t lines < <(python3 -c "
-import json
-with open('$HOME/.claude.json') as f:
-    d = json.load(f)
-seed = {k: d[k] for k in ('oauthAccount','hasCompletedOnboarding','lastOnboardingVersion','userID','opusProMigrationComplete','sonnet1m45MigrationComplete') if k in d}
-seed['numStartups'] = 1
-seed['projects'] = {'/workspace': {'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {}, 'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [], 'hasTrustDialogAccepted': True}}
-s = {
-    'model': 'claude-opus-4-6',
-    'skipDangerousModePermissionPrompt': True,
-    'env': {
-        'GIT_DIR': '/git/worktrees/$branch',
-        'GIT_COMMON_DIR': '/git'
-    }
-}
-print(json.dumps(seed))
-print(json.dumps(s))
-" 2>/dev/null) || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
-    local claude_seed="${lines[0]}" settings_json="${lines[1]}"
-
-    # init_cmd runs as vscode (set in DC_IMAGE). HOME=/home/vscode.
-    local init_cmd
-    init_cmd="mkdir -p ~/.claude"
-    init_cmd="$init_cmd && echo $(printf '%q' "$claude_seed") > ~/.claude.json"
-    init_cmd="$init_cmd && echo $(printf '%q' "$settings_json") > ~/.claude/settings.json"
-    if [ -n "$POST_CREATE" ]; then
-        init_cmd="$init_cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
-    fi
-    init_cmd="$init_cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $issue\""
-
-    exec docker run -it --name "$CONTAINER" \
-        -v "$worktree:/workspace" \
-        -v "$repo_root/.git:/git" \
-        -v "$repo_root/.git/config:/git/config:ro" \
-        -v "$repo_root/.devcontainer:/workspace/.devcontainer:ro" \
-        "${token_args[@]+"${token_args[@]}"}" \
-        "${git_env_args[@]}" \
-        "${mount_args[@]+"${mount_args[@]}"}" \
-        -w /workspace \
-        "$DC_IMAGE" \
-        bash -c "$init_cmd"
-}
-
-# --connect mode: called inside the tmux window
-if [ "${1:-}" = "--connect" ]; then
-    do_connect "${2:?Usage: dispatchdc --connect <repo_root> <branch> <issue>}" \
-               "${3:?Missing branch}" \
-               "${4:?Missing issue}"
-    exit 0
-fi
-
-# --- Main: resolve repo, create worktree, build image, open tmux window ---
+source "$(dirname "$(readlink -f "$0")")/dc-lib"
 
 ISSUE="${1:-}"
 if [ -z "$ISSUE" ]; then
@@ -202,24 +27,25 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
     exit 1
 }
 
-DOCKERFILE="$REPO_ROOT/.devcontainer/Dockerfile"
-if [ ! -f "$DOCKERFILE" ]; then
+if [ ! -f "$REPO_ROOT/.devcontainer/Dockerfile" ]; then
     echo "Error: no .devcontainer/Dockerfile in $REPO_ROOT" >&2
     exit 1
 fi
 
-# Check if a worktree already exists for this issue
+if [ -z "${TMUX:-}" ]; then
+    echo "Error: not inside a tmux session" >&2
+    exit 1
+fi
+
+# Find or create worktree for this issue
 WORKTREE="$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' || true)"
 
 if [ -z "$WORKTREE" ]; then
-    WORKTREE_DIR="$(dirname "$REPO_ROOT")"
     TITLE="$(gh issue view "$ISSUE" --json title -q '.title')"
-    SLUG="$(slugify "$TITLE")"
-    BRANCH="${ISSUE}-${SLUG}"
-    WORKTREE="${WORKTREE_DIR}/${BRANCH}"
+    BRANCH="${ISSUE}-$(slugify "$TITLE")"
+    WORKTREE="$(dirname "$REPO_ROOT")/$BRANCH"
     echo "Creating worktree for issue #$ISSUE..."
     git worktree add "$WORKTREE" -b "$BRANCH"
-
     if [ -f "$REPO_ROOT/.env" ]; then
         cp "$REPO_ROOT/.env" "$WORKTREE/.env"
         echo "Copied .env to worktree"
@@ -228,36 +54,8 @@ fi
 
 BRANCH="$(basename "$WORKTREE")"
 
-derive_names "$REPO_ROOT" "$BRANCH"
+dc-build "$REPO_ROOT"
 
-# Compute hash of devcontainer config files to detect changes
-HASH_FILES=()
-for f in "$REPO_ROOT/api/requirements.txt" "$REPO_ROOT/api/requirements-dev.txt"; do
-    [ -f "$f" ] && HASH_FILES+=("$f")
-done
-DEVCONTAINER_HASH="$({ find "$REPO_ROOT/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}"; } | shasum -a 256 | cut -d' ' -f1)"
-EXISTING_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "devcontainer.hash"}}' 2>/dev/null || true)"
-
-if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
-    echo "Building devcontainer image '$IMAGE'..."
-    docker build -t "$IMAGE" --label "devcontainer.hash=$DEVCONTAINER_HASH" \
-        -f "$DOCKERFILE" "$REPO_ROOT"
-    # Base changed — remove stale DC wrapper and container
-    docker rmi "$DC_IMAGE" 2>/dev/null || true
-    docker rm -f "$CONTAINER" 2>/dev/null || true
-fi
-
-# Build DC wrapper image if it doesn't exist
-if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
-    build_dc_image "$IMAGE" "$DC_IMAGE"
-fi
-
-SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-
-if [ -z "${TMUX:-}" ]; then
-    echo "Error: not inside a tmux session" >&2
-    exit 1
-fi
-
+BIN="$(dirname "$(readlink -f "$0")")"
 tmux new-window -n "${BRANCH:0:16}" \
-    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$SCRIPT_PATH\" --connect \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\""
+    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\""
