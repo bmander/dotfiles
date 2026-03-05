@@ -6,3 +6,4 @@ Merge and clean up the branch for issue $ARGUMENTS:
 4. Close the issue: `gh issue close $ARGUMENTS`
 5. Delete the local branch: `git branch -d <branch-name>`
 6. Close the tmux window that was running the worktree: find it with `tmux list-windows` (grep for the issue number), then `tmux kill-window -t <window>`
+7. Remove any devcontainer associated with the branch: the container name is `devcontainer-<branch-name>`. Check with `docker container inspect devcontainer-<branch-name>` and if it exists, remove it with `docker rm -f devcontainer-<branch-name>`.
