@@ -52,7 +52,7 @@ build_dc_image() {
         mkdir "$tmpdir/commands"
     fi
 
-    # Wrapper script: restrict gh to issue and pr subcommands only
+    # Wrapper: restrict gh to issue and pr subcommands only
     cat > "$tmpdir/gh-sandbox" <<'GHEOF'
 #!/usr/bin/env bash
 cmd="${1:-}"
@@ -61,6 +61,7 @@ case "$cmd" in
     *) echo "gh: '$cmd' is not permitted in this sandbox (allowed: issue, pr)" >&2; exit 1 ;;
 esac
 GHEOF
+
 
     cat > "$tmpdir/Dockerfile" <<EOF
 FROM $base_image
@@ -170,6 +171,7 @@ print(json.dumps(s))
     exec docker run -it --name "$CONTAINER" \
         -v "$worktree:/workspace" \
         -v "$repo_root/.git:/git" \
+        -v "$repo_root/.git/config:/git/config:ro" \
         -v "$repo_root/.devcontainer:/workspace/.devcontainer:ro" \
         "${token_args[@]+"${token_args[@]}"}" \
         "${git_env_args[@]}" \
