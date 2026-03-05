@@ -68,7 +68,7 @@ for m in "${MOUNTS[@]+"${MOUNTS[@]}"}"; do
     mount_args+=(--mount "$m")
 done
 
-mapfile -t lines < <(python3 -c "
+_json_out="$(python3 -c "
 import json
 with open('$HOME/.claude.json') as f:
     d = json.load(f)
@@ -85,9 +85,9 @@ s = {
 }
 print(json.dumps(seed))
 print(json.dumps(s))
-" 2>/dev/null) || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
-CLAUDE_SEED="${lines[0]}"
-SETTINGS_JSON="${lines[1]}"
+" 2>/dev/null)" || { echo "Error: failed to read $HOME/.claude.json — run claude once locally first" >&2; exit 1; }
+CLAUDE_SEED="${_json_out%%$'\n'*}"
+SETTINGS_JSON="${_json_out#*$'\n'}"
 
 # init_cmd runs as vscode (USER set in DC_IMAGE). HOME=/home/vscode.
 init_cmd="mkdir -p ~/.claude"
