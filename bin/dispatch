@@ -10,20 +10,17 @@ if [ -z "$ISSUE" ]; then
   exit 1
 fi
 
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
 # Check if a worktree already exists for this issue
-WORKTREE=$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}')
+WORKTREE=$(git worktree list | grep -E "/${ISSUE}-[^/]*$" | awk '{print $1}' || true)
 
 if [ -z "$WORKTREE" ]; then
-  REPO_ROOT=$(git rev-parse --show-toplevel)
-  WORKTREE_DIR=$(dirname "$REPO_ROOT")
-  # Fetch the issue title from GitHub and slugify it for the branch name
-  TITLE=$(gh issue view "$ISSUE" --json title -q '.title')
-  BRANCH="${ISSUE}-$(slugify "$TITLE")"
-  WORKTREE="${WORKTREE_DIR}/${BRANCH}"
+  derive_branch_name "$ISSUE"
+  WORKTREE="$(dirname "$REPO_ROOT")/${BRANCH}"
   echo "Creating worktree for issue #$ISSUE..."
   git worktree add "$WORKTREE" -b "$BRANCH"
 
-  # Copy root .env to the new worktree if it exists
   if [ -f "$REPO_ROOT/.env" ]; then
     cp "$REPO_ROOT/.env" "$WORKTREE/.env"
     echo "Copied .env to worktree"
