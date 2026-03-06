@@ -118,6 +118,9 @@ build_init_cmd() {
     local cmd="mkdir -p ~/.claude"
     cmd="$cmd && echo $(printf '%q' "$CLAUDE_SEED") > ~/.claude.json"
     cmd="$cmd && echo $(printf '%q' "$SETTINGS_JSON") > ~/.claude/settings.json"
+    # Configure git to push over HTTPS using GH_TOKEN
+    cmd="$cmd && git config --global credential.helper '!f(){ echo username=x-access-token; echo password=\$GH_TOKEN; };f'"
+    cmd="$cmd && git config --global url.\"https://github.com/\".insteadOf \"git@github.com:\""
     if [ -n "$workspace_setup" ]; then
         cmd="$cmd && $workspace_setup"
     fi
