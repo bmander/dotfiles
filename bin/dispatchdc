@@ -5,18 +5,26 @@ set -euo pipefail
 # fresh git worktree. Fails if a worktree for the issue already exists unless
 # --use-old-worktree is passed.
 #
-# Usage: dispatchdc <issue-number> [--use-old-worktree]
+# Usage: dispatchdc <issue-number> [--use-old-worktree] [--forward containerPort:hostPort ...]
 
 source "$(dirname "$(readlink -f "$0")")/dc-lib"
 
 USE_OLD_WORKTREE=0
 ISSUE=""
+FORWARD_ARGS=()
+expect_forward=0
 for arg in "$@"; do
+    if [ "$expect_forward" -eq 1 ]; then
+        FORWARD_ARGS+=(--forward "$arg")
+        expect_forward=0
+        continue
+    fi
     case "$arg" in
         --use-old-worktree) USE_OLD_WORKTREE=1 ;;
+        --forward) expect_forward=1 ;;
         *)
             if [ -n "$ISSUE" ]; then
-                echo "Usage: dispatchdc <issue-number> [--use-old-worktree]" >&2
+                echo "Usage: dispatchdc <issue-number> [--use-old-worktree] [--forward containerPort:hostPort ...]" >&2
                 exit 1
             fi
             ISSUE="$arg" ;;
@@ -24,7 +32,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$ISSUE" ]; then
-    echo "Usage: dispatchdc <issue-number> [--use-old-worktree]"
+    echo "Usage: dispatchdc <issue-number> [--use-old-worktree] [--forward containerPort:hostPort ...]"
     exit 1
 fi
 
@@ -55,5 +63,10 @@ BRANCH="$(basename "$WORKTREE")"
 BIN="$(dirname "$(readlink -f "$0")")"
 "$BIN/dc-build" "$REPO_ROOT"
 
+FORWARD_STR=""
+for fa in "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"; do
+    FORWARD_STR="$FORWARD_STR $(printf '%q' "$fa")"
+done
+
 tmux new-window -n "${BRANCH:0:16}" \
-    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\" || { echo '--- dc-connect failed (exit \$?) — press Enter to close ---'; read; }"
+    "CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\" \"$BIN/dc-connect\" \"$REPO_ROOT\" \"$BRANCH\" \"$ISSUE\"$FORWARD_STR || { echo '--- dc-connect failed (exit \$?) — press Enter to close ---'; read; }"

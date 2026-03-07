@@ -5,13 +5,26 @@ set -euo pipefail
 # If the container is already running, execs a bash session into it.
 # Otherwise creates a fresh container and launches Claude Code.
 #
-# Usage: dc-connect <repo_root> <branch> <issue>
+# Usage: dc-connect <repo_root> <branch> <issue> [--forward containerPort:hostPort ...]
 
 source "$(dirname "$(readlink -f "$0")")/dc-lib"
 
 REPO_ROOT="${1:?Usage: dc-connect <repo_root> <branch> <issue>}"
 BRANCH="${2:?Missing branch}"
 ISSUE="${3:?Missing issue}"
+shift 3
+
+port_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --forward)
+            # Expect containerPort:hostPort, map to -p hostPort:containerPort
+            IFS=: read -r cport hport <<< "$2"
+            port_args+=(-p "$hport:$cport")
+            shift 2 ;;
+        *) shift ;;
+    esac
+done
 
 derive_names "$REPO_ROOT" "$BRANCH"
 
@@ -49,8 +62,8 @@ if [ ! -d "$WORKTREE" ]; then
 fi
 
 exec docker run -it --name "$CONTAINER" \
-    --cap-add=NET_ADMIN \
-    --cap-add=NET_RAW \
+    --cap-add=NET_ADMIN --cap-add=NET_RAW \
+    "${port_args[@]+"${port_args[@]}"}" \
     -v "$WORKTREE:/workspace" \
     -v "$REPO_ROOT/.git:/git" \
     -v "$REPO_ROOT/.git/config:/git/config:ro" \

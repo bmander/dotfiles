@@ -77,7 +77,7 @@ HASH_FILES=()
 for f in "$REPO_ROOT/api/requirements.txt" "$REPO_ROOT/api/requirements-dev.txt"; do
     [ -f "$f" ] && HASH_FILES+=("$f")
 done
-DEVCONTAINER_HASH="$({ find "$REPO_ROOT/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}"; } | shasum -a 256 | cut -d' ' -f1)"
+DEVCONTAINER_HASH="$({ find "$REPO_ROOT/.devcontainer" -type f ! -name '*.dockerignore' -print0 | sort -z | xargs -0 cat; [ ${#HASH_FILES[@]} -gt 0 ] && cat "${HASH_FILES[@]}" || true; } | shasum -a 256 | cut -d' ' -f1)"
 EXISTING_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "devcontainer.hash"}}' 2>/dev/null || true)"
 
 if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
