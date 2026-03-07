@@ -128,6 +128,7 @@ build_init_cmd() {
         cmd="$cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
     fi
     cmd="$cmd && echo '>>> Initializing network firewall...' && sudo /usr/local/bin/init-firewall.sh"
+    cmd="$cmd && [ -f /tmp/proxy.env ] && . /tmp/proxy.env"
     cmd="$cmd && cd /workspace && exec claude --permission-mode bypassPermissions \"/work-issue $issue\""
     echo "$cmd"
 }
