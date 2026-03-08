@@ -68,8 +68,10 @@ COPY --chown=vscode:vscode commands /home/vscode/.claude/commands/
 USER vscode
 EOF
 
+    local base_id
+    base_id="$(docker image inspect "$base_image" --format '{{.Id}}' 2>/dev/null || true)"
     echo "Building dispatch wrapper image '$dc_image'..."
-    docker build -t "$dc_image" "$tmpdir"
+    docker build -t "$dc_image" --label "dc.base_id=$base_id" "$tmpdir"
 }
 
 # Compute hash of devcontainer config + python dependency files
@@ -88,6 +90,15 @@ if [ "$DEVCONTAINER_HASH" != "$EXISTING_HASH" ]; then
     docker rmi "$DC_IMAGE" 2>/dev/null || true
 fi
 
-if ! docker image inspect "$DC_IMAGE" &>/dev/null; then
+if docker image inspect "$DC_IMAGE" &>/dev/null; then
+    # Ensure wrapper is built on the current base image
+    BASE_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+    WRAPPER_BASE="$(docker image inspect "$DC_IMAGE" --format '{{index .Config.Labels "dc.base_id"}}' 2>/dev/null || true)"
+    if [ -n "$BASE_ID" ] && [ "$WRAPPER_BASE" != "$BASE_ID" ]; then
+        echo "Wrapper image is stale (base image changed), rebuilding..."
+        docker rmi "$DC_IMAGE" 2>/dev/null || true
+        build_dc_image "$IMAGE" "$DC_IMAGE"
+    fi
+else
     build_dc_image "$IMAGE" "$DC_IMAGE"
 fi

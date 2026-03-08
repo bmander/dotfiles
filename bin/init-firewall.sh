@@ -117,6 +117,13 @@ if [ -n "$host_gateway" ]; then
     iptables -A OUTPUT -d "$host_gateway" -j ACCEPT
 fi
 
+# Allow host.docker.internal (Docker Desktop resolves this to a different IP than the gateway)
+# Filter to IPv4 only since iptables can't handle IPv6 addresses
+host_internal="$(getent ahostsv4 host.docker.internal 2>/dev/null | awk 'NR==1{print $1}')"
+if [ -n "$host_internal" ] && [ "$host_internal" != "$host_gateway" ]; then
+    iptables -A OUTPUT -d "$host_internal" -j ACCEPT
+fi
+
 # Allow tinyproxy direct outbound on 80/443
 proxy_uid="$(id -u "$PROXY_USER")"
 iptables -A OUTPUT -m owner --uid-owner "$proxy_uid" -p tcp --dport 80 -j ACCEPT

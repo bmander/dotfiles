@@ -46,6 +46,7 @@ parse_devcontainer_json() {
     local config="$repo_root/.devcontainer/devcontainer.json"
     MOUNTS=()
     POST_CREATE=""
+    POST_START=""
     if [ -f "$config" ] && command -v python3 &>/dev/null; then
         eval "$(python3 -c "
 import json, re, shlex
@@ -57,6 +58,8 @@ for i, m in enumerate(mounts):
     print(f'MOUNTS[{i}]={shlex.quote(m)}')
 pc = cfg.get('postCreateCommand', '')
 print(f'POST_CREATE={shlex.quote(pc)}')
+ps = cfg.get('postStartCommand', '')
+print(f'POST_START={shlex.quote(ps)}')
 " 2>/dev/null)"
     fi
 }
@@ -125,7 +128,10 @@ build_init_cmd() {
         cmd="$cmd && $workspace_setup"
     fi
     if [ -n "$POST_CREATE" ]; then
-        cmd="$cmd && echo '>>> Running postCreateCommand...' && { $POST_CREATE || echo 'Warning: postCreateCommand failed, continuing...'; }"
+        cmd="$cmd && echo '>>> Running postCreateCommand...' && (eval $POST_CREATE || true)"
+    fi
+    if [ -n "$POST_START" ]; then
+        cmd="$cmd && echo '>>> Running postStartCommand...' && (eval $POST_START)"
     fi
     cmd="$cmd && echo '>>> Initializing network firewall...' && sudo /usr/local/bin/init-firewall.sh"
     cmd="$cmd && [ -f /tmp/proxy.env ] && . /tmp/proxy.env"
